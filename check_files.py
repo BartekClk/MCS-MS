@@ -60,6 +60,15 @@ def verify_and_create_paths(env_path: str | Path = ".env") -> dict[str, Path]:
     if not token_path.exists():
         log("WARN", f"Google OAuth2 token file not found at: {token_path}", module="CHECK_FILES")
 
+    retention_raw = _require_env_str("BACKUP_RETENTION_DAYS")
+    try:
+        if int(retention_raw) < 0:
+            raise ValueError("Must be >= 0")
+    except ValueError as e:
+        msg = f"Invalid BACKUP_RETENTION_DAYS in .env (expected integer >= 0): {retention_raw}"
+        log("ERROR", msg, module="CHECK_FILES")
+        raise ValueError(msg) from e
+
     log("SUCCESS", "Environment configuration and paths verified.", module="CHECK_FILES")
 
     return {

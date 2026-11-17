@@ -3,7 +3,7 @@ import os
 import stat
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator, Iterable, Tuple, Any
 
@@ -14,7 +14,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.http import MediaUpload
 
 from logger import MCSLogger, log
 
@@ -37,33 +37,69 @@ class BackupUploadError(BackupError):
     """Raised when archive streaming or Google Drive upload fails."""
 
 
-class _StreamReader(io.RawIOBase):
-    """Adapter converting a byte generator into a file-like object with readinto() for Google API."""
+class _StreamingZipUpload(MediaUpload):
+    """Resumable Google Drive MediaUpload adapter for on-the-fly byte generators of unknown total size."""
 
-    def __init__(self, generator: Iterator[bytes]):
+    def __init__(self, generator: Iterator[bytes], chunksize: int, mimetype: str = "application/zip"):
         self._gen = generator
+        self._chunksize = chunksize
+        self._mimetype = mimetype
         self._buffer = bytearray()
+        self._buffer_start = 0
+        self._stream_pos = 0
         self._eof = False
 
-    def readable(self) -> bool:
+    def chunksize(self) -> int:
+        return self._chunksize
+
+    def mimetype(self) -> str:
+        return self._mimetype
+
+    def size(self) -> int | None:
+        return None
+
+    def resumable(self) -> bool:
         return True
 
-    def readinto(self, b: bytearray) -> int:
-        if self._eof and not self._buffer:
-            return 0
+    def getbytes(self, begin: int, length: int) -> bytes:
+        """Returns a byte slice starting at offset `begin`, advancing the ZIP generator as needed."""
+        if begin < self._buffer_start:
+            raise BackupUploadError(
+                f"Cannot rewind non-seekable ZIP stream (requested offset {begin}, current buffer start {self._buffer_start})."
+            )
 
-        while len(self._buffer) < len(b) and not self._eof:
+        if begin > self._buffer_start:
+            if begin <= self._stream_pos:
+                drop = begin - self._buffer_start
+                del self._buffer[:drop]
+                self._buffer_start = begin
+            else:
+                self._buffer.clear()
+                to_skip = begin - self._stream_pos
+                while to_skip > 0 and not self._eof:
+                    try:
+                        chunk = next(self._gen)
+                        self._stream_pos += len(chunk)
+                        if len(chunk) <= to_skip:
+                            to_skip -= len(chunk)
+                        else:
+                            self._buffer.extend(chunk[to_skip:])
+                            to_skip = 0
+                    except StopIteration:
+                        self._eof = True
+                        break
+                self._buffer_start = begin
+
+        while len(self._buffer) < length and not self._eof:
             try:
                 chunk = next(self._gen)
                 self._buffer.extend(chunk)
+                self._stream_pos += len(chunk)
             except StopIteration:
                 self._eof = True
                 break
 
-        n = min(len(b), len(self._buffer))
-        b[:n] = self._buffer[:n]
-        del self._buffer[:n]
-        return n
+        return bytes(self._buffer[:length])
 
 
 def _get_oauth_credentials(token_path: Path, logger: MCSLogger) -> Credentials:
@@ -155,15 +191,102 @@ def _iter_directory_files(
                 raise BackupUploadError(f"Permission denied accessing file {full_path}: {e}") from e
 
 
+def _cleanup_old_backups(
+    service: Any,
+    gdrive_folder_id: str,
+    archive_prefix: str,
+    retention_days: int,
+    logger: MCSLogger
+) -> int:
+    """
+    Permanently deletes backup archives matching archive_prefix in the target Google Drive folder
+    that are older than retention_days.
+
+    :param service: Authenticated Google Drive API v3 resource.
+    :param gdrive_folder_id: Target Google Drive folder ID.
+    :param archive_prefix: Filename prefix used to identify backup archives.
+    :param retention_days: Maximum age in days before a backup is deleted (0 disables cleanup).
+    :param logger: Active MCSLogger instance for recording cleanup actions.
+    :return: Number of successfully deleted old backup files.
+    """
+    if retention_days <= 0:
+        logger.write("DEBUG", "Automatic backup retention cleanup is disabled (BACKUP_RETENTION_DAYS <= 0).")
+        return 0
+
+    cutoff_utc = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    cutoff_rfc3339 = cutoff_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    safe_prefix = archive_prefix.replace("'", "\\'")
+
+    query = (
+        f"'{gdrive_folder_id}' in parents and "
+        f"trashed = false and "
+        f"mimeType = 'application/zip' and "
+        f"name contains '{safe_prefix}_' and "
+        f"createdTime < '{cutoff_rfc3339}'"
+    )
+
+    logger.write("INFO", f"Checking for backups older than {retention_days} days (before {cutoff_rfc3339})...")
+
+    deleted_count = 0
+    freed_bytes = 0
+    page_token: str | None = None
+
+    try:
+        while True:
+            response = service.files().list(
+                q=query,
+                spaces="drive",
+                fields="nextPageToken, files(id, name, createdTime, size)",
+                pageToken=page_token
+            ).execute()
+
+            for item in response.get("files", []):
+                file_id = item["id"]
+                file_name = item["name"]
+                created_time = item.get("createdTime", "unknown")
+                file_size = int(item.get("size", 0))
+
+                try:
+                    service.files().delete(fileId=file_id).execute()
+                    deleted_count += 1
+                    freed_bytes += file_size
+                    logger.write(
+                        "INFO",
+                        f"Deleted expired backup: {file_name} (Created: {created_time}, Freed: {file_size / (1024 * 1024):.2f} MB)"
+                    )
+                except HttpError as e:
+                    logger.write("WARN", f"Failed to delete expired backup {file_name} (ID: {file_id}): {e}")
+
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+
+    except HttpError as e:
+        logger.write("WARN", f"Failed to query Google Drive for expired backups: {e}")
+        return deleted_count
+
+    if deleted_count > 0:
+        freed_mb = freed_bytes / (1024 * 1024)
+        summary = f"Retention cleanup finished: removed {deleted_count} old backup(s), freed {freed_mb:.2f} MB."
+        logger.write("SUCCESS", summary)
+        log("INFO", summary, module="BACKUP")
+    else:
+        logger.write("INFO", "No expired backups found for deletion.")
+
+    return deleted_count
+
+
 def run_backup(env_path: str | Path = ".env", full_backup: bool = False) -> dict[str, Any]:
     """
     Streams an uncompressed ZIP64 backup of either the world folder or the entire server directory
-    directly to Google Drive via OAuth2, logs detailed progress, and renders a live console status.
+    directly to Google Drive via OAuth2, cleans up expired backups based on BACKUP_RETENTION_DAYS,
+    logs detailed progress, and renders a live console status.
 
     :param env_path: Path to the .env configuration file.
     :param full_backup: If False, backs up only the world folder inside SERVER_DIR.
                         If True, backs up the entire SERVER_DIR with a '_full_' archive tag.
-    :return: Status dictionary on success ('status', 'backup_type', 'message', 'file_id', 'archive_name', 'files_count', 'size_bytes', 'log_file').
+    :return: Status dictionary on success ('status', 'backup_type', 'message', 'file_id', 'archive_name',
+             'files_count', 'size_bytes', 'deleted_old_backups', 'log_file').
     :raises BackupConfigError: If configuration or target paths are missing/invalid.
     :raises BackupAuthError: If OAuth2 authentication fails.
     :raises BackupUploadError: If archiving or Google Drive upload fails.
@@ -172,7 +295,7 @@ def run_backup(env_path: str | Path = ".env", full_backup: bool = False) -> dict
     if env_file.exists():
         load_dotenv(dotenv_path=env_file)
 
-    logs_dir = Path(os.getenv("LOGS_DIR", "./mcsms_data/logs")).resolve()
+    logs_dir = Path(os.getenv("LOGS_DIR", "./mcsms_data/logs")).expanduser().resolve()
     backup_logger = MCSLogger(prefix="backup", logs_dir=logs_dir, per_run=True, default_module="BACKUP")
 
     backup_mode_label = "FULL SERVER" if full_backup else "WORLD"
@@ -182,11 +305,17 @@ def run_backup(env_path: str | Path = ".env", full_backup: bool = False) -> dict
         if not env_file.exists():
             raise BackupConfigError(f"Configuration file not found: {env_file.resolve()}")
 
-        server_dir = Path(os.getenv("SERVER_DIR", "./server")).resolve()
-        world_folder_name = os.getenv("WORLD_FOLDER_NAME", "world").strip() or "world"
-        archive_prefix = os.getenv("BACKUP_ARCHIVE_PREFIX", "mc_server").strip()
+        server_dir_raw = os.getenv("SERVER_DIR", "").strip()
+        world_folder_name = os.getenv("WORLD_FOLDER_NAME", "").strip()
+        archive_prefix = os.getenv("BACKUP_ARCHIVE_PREFIX", "").strip()
         gdrive_folder_id = os.getenv("GDRIVE_FOLDER_ID", "").strip()
-        token_path = Path(os.getenv("GDRIVE_TOKEN_PATH", "./token.json")).resolve()
+        token_path_raw = os.getenv("GDRIVE_TOKEN_PATH", "").strip()
+
+        if not all([server_dir_raw, world_folder_name, archive_prefix, gdrive_folder_id, token_path_raw]):
+            raise BackupConfigError("One or more required backup variables are missing or empty in .env.")
+
+        server_dir = Path(server_dir_raw).expanduser().resolve()
+        token_path = Path(token_path_raw).expanduser().resolve()
 
         try:
             chunk_size_mb = int(os.getenv("BACKUP_CHUNK_SIZE_MB", "10"))
@@ -195,11 +324,15 @@ def run_backup(env_path: str | Path = ".env", full_backup: bool = False) -> dict
         except ValueError as e:
             raise BackupConfigError(f"Invalid BACKUP_CHUNK_SIZE_MB value: {e}") from e
 
+        try:
+            retention_days = int(os.getenv("BACKUP_RETENTION_DAYS", "0"))
+            if retention_days < 0:
+                raise ValueError("Retention days cannot be negative.")
+        except ValueError as e:
+            raise BackupConfigError(f"Invalid BACKUP_RETENTION_DAYS value: {e}") from e
+
         raw_excludes = os.getenv("BACKUP_EXCLUDE_DIRS", "")
         exclude_dirs = {item.strip() for item in raw_excludes.split(",") if item.strip()}
-
-        if not gdrive_folder_id:
-            raise BackupConfigError("GDRIVE_FOLDER_ID is not set in the .env configuration.")
 
         if not server_dir.is_dir():
             raise BackupConfigError(f"Server root directory does not exist: {server_dir}")
@@ -207,7 +340,6 @@ def run_backup(env_path: str | Path = ".env", full_backup: bool = False) -> dict
         if full_backup:
             target_dir = server_dir
             archive_tag = "full"
-            # Prevent packing active MCS-MS logs if logs_dir resides inside server_dir
             if logs_dir.is_relative_to(target_dir):
                 exclude_dirs.add(logs_dir.relative_to(target_dir).parts[0])
         else:
@@ -235,7 +367,6 @@ def run_backup(env_path: str | Path = ".env", full_backup: bool = False) -> dict
             exclude_dirs=exclude_dirs
         )
         zip_generator = stream_zip(files_iterable, chunk_size=1024 * 1024)
-        stream_reader = io.BufferedReader(_StreamReader(zip_generator), buffer_size=1024 * 1024)
 
         file_metadata = {
             "name": archive_name,
@@ -243,11 +374,10 @@ def run_backup(env_path: str | Path = ".env", full_backup: bool = False) -> dict
         }
 
         upload_chunk_size = chunk_size_mb * 1024 * 1024
-        media = MediaIoBaseUpload(
-            stream_reader,
-            mimetype="application/zip",
+        media = _StreamingZipUpload(
+            generator=zip_generator,
             chunksize=upload_chunk_size,
-            resumable=True
+            mimetype="application/zip"
         )
 
         backup_logger.write("INFO", f"Streaming archive directly to Google Drive (folder: {gdrive_folder_id})...")
@@ -295,6 +425,15 @@ def run_backup(env_path: str | Path = ".env", full_backup: bool = False) -> dict
         backup_logger.write("SUCCESS", summary)
         log("SUCCESS", summary, module="BACKUP")
 
+        # Clean up expired backups only after the new archive has been uploaded safely
+        deleted_old_count = _cleanup_old_backups(
+            service=service,
+            gdrive_folder_id=gdrive_folder_id,
+            archive_prefix=archive_prefix,
+            retention_days=retention_days,
+            logger=backup_logger
+        )
+
         return {
             "status": "SUCCESS",
             "backup_type": archive_tag.upper(),
@@ -303,6 +442,7 @@ def run_backup(env_path: str | Path = ".env", full_backup: bool = False) -> dict
             "archive_name": archive_name,
             "files_count": stats["files"],
             "size_bytes": int(response.get("size", 0)),
+            "deleted_old_backups": deleted_old_count,
             "log_file": str(backup_logger.log_file)
         }
 
