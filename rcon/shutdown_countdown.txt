@@ -1,0 +1,16 @@
+say [MCS-MS] Restart serwera za 10 sekund!
+sleep(5)
+say [MCS-MS] Restart serwera za 5 sekund!
+sleep(1)
+say [MCS-MS] Restart serwera za 4 sekundy!
+sleep(1)
+say [MCS-MS] Restart serwera za 3 sekundy!
+sleep(1)
+say [MCS-MS] Restart serwera za 2 sekundy!
+sleep(1)
+say [MCS-MS] Restart serwera za 1 sekunde!
+sleep(1)
+
+save-all
+sleep(2)
+stop

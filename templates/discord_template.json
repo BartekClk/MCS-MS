@@ -1,0 +1,31 @@
+{
+  "username": "SZPONT MC",
+  "avatar_url": "",
+  "embeds": [
+    {
+      "title": "🚀 Nowa aktualizacja paczki: %pack_version%",
+      "url": "%release_url%",
+      "color": 3066993,
+      "fields": [
+        {
+          "name": "Wersja:",
+          "value": "`%pack_version%`",
+          "inline": false
+        },
+        {
+          "name": "Lista zmian:",
+          "value": "%changelog%",
+          "inline": false
+        },
+        {
+          "name": "Pobieranie",
+          "value": "[Kliknij tutaj, aby przejść do wydania](%release_url%)",
+          "inline": false
+        }
+      ],
+      "footer": {
+        "text": "szpontmc.com • Zaktualizuj paczkę w launcherze przed wejściem!"
+      }
+    }
+  ]
+}

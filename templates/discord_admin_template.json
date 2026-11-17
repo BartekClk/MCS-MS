@@ -1,0 +1,29 @@
+{
+  "username": "MCS-MS Monitor SzpontMC",
+  "embeds": [
+    {
+      "title": "%status_icon% Raport wykonania: %command%",
+      "color": 3066993,
+      "fields": [
+        {
+          "name": "Status",
+          "value": "`%status_text%` (exit code: `%exit_code%`)",
+          "inline": true
+        },
+        {
+          "name": "Czas trwania",
+          "value": "`%duration%`",
+          "inline": true
+        },
+        {
+          "name": "Szczegóły",
+          "value": "%details%",
+          "inline": false
+        }
+      ],
+      "footer": {
+        "text": "MCS-MS • Host: %hostname%"
+      }
+    }
+  ]
+}
