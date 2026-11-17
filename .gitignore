@@ -1,3 +1,6 @@
-mcsms_data/
+mcsms_data/*
+!mcsms_data/.gitkeep
 .env
-Google_OAuth_Files/
+Google_OAuth_Files/*
+!Google_OAuth_Files/.gitkeep
+__pycache__/
